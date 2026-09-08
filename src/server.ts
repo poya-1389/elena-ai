@@ -97,7 +97,44 @@ interface BotSettingsRecord {
 
 /* ---------------------------- Config ---------------------------- */
 
+/**
+ * اعتبارسنجی متغیرهای محیطی الزامی — همه با هم بررسی می‌شوند (نه یکی‌یکی)
+ * تا اگر چند تا ناقص باشند، همه با هم در یک پیام واضح دیده شوند، نه اینکه
+ * برنامه سر اولین‌ متغیر ناقص کرش کند و بقیه‌ی مشکلات معلوم نشوند.
+ *
+ * فقط دو متغیر واقعاً الزامی‌اند (بدون این‌ها ربات اصلاً بالا نمی‌آید):
+ *   - TELEGRAM_BOT_TOKEN
+ *   - REDIS_URL
+ * کلید Provider هوش مصنوعی (MOONSHOT_API_KEY / XAI_API_KEY / OPENROUTER_API_KEY)
+ * عمداً اینجا الزامی نیست، چون بدونش هم سرور بالا می‌آید (فقط جواب هوشمند نمی‌ده)؛
+ * وضعیتش جدا و به‌صورت هشدار (نه کرش) در لاگ استارتاپ و در پنل ادمین گزارش می‌شود.
+ */
+const REQUIRED_ENV_VARS = ["TELEGRAM_BOT_TOKEN", "REDIS_URL"] as const;
+
+function assertRequiredEnv(): void {
+  const missing = REQUIRED_ENV_VARS.filter((name) => !process.env[name] || !process.env[name]!.trim());
+  if (missing.length === 0) return;
+  const lines = [
+    "",
+    "══════════════════════════════════════════════════════════",
+    "❌ الینا بالا نیامد: متغیرهای محیطی الزامی زیر تنظیم نشده‌اند:",
+    ...missing.map((m) => `   • ${m}`),
+    "",
+    "این‌ها را در تنظیمات Environment Variables پروژه (روی Railway: Variables) اضافه کن:",
+    "   TELEGRAM_BOT_TOKEN  → توکنی که از @BotFather گرفتی",
+    "   REDIS_URL           → آدرس اتصال Redis (مثلاً از سرویس Redis همان پروژه در Railway؛",
+    "                          اگر Redis را به‌صورت سرویس جدا اضافه کردی، از تب Variables آن",
+    "                          سرویس مقدار REDIS_URL یا REDIS_PUBLIC_URL را کپی کن)",
+    "══════════════════════════════════════════════════════════",
+    "",
+  ];
+  console.error(lines.join("\n"));
+  process.exit(1);
+}
+assertRequiredEnv();
+
 function required(name: string): string {
+  // در این نقطه assertRequiredEnv() قبلاً اجرا شده، پس این فقط یک تضمین نوعی (type-safe) است.
   const v = process.env[name];
   if (!v) throw new Error(`Missing required environment variable: ${name}`);
   return v;
@@ -141,6 +178,59 @@ const config = {
 
 function isAdmin(userId: number): boolean {
   return config.admin.ids.includes(userId);
+}
+
+/* ---------------------------- Environment Diagnostics ---------------------------- */
+
+/** پنهان‌سازی مقدار حساس برای نمایش در لاگ/پنل ادمین (مثلاً توکن یا API Key) */
+function maskSecret(value?: string): string {
+  if (!value) return "—";
+  const v = value.trim();
+  if (v.length <= 8) return "••••";
+  return `${v.slice(0, 4)}••••${v.slice(-4)}`;
+}
+
+interface EnvDiagLine { label: string; ok: boolean; detail: string; }
+
+/** خلاصه‌ی وضعیت متغیرهای محیطی مهم — هم در لاگ استارتاپ و هم در پنل ادمین استفاده می‌شود */
+function collectEnvDiagnostics(): EnvDiagLine[] {
+  const lines: EnvDiagLine[] = [];
+  lines.push({ label: "TELEGRAM_BOT_TOKEN", ok: !!process.env.TELEGRAM_BOT_TOKEN, detail: maskSecret(process.env.TELEGRAM_BOT_TOKEN) });
+  lines.push({ label: "REDIS_URL", ok: !!process.env.REDIS_URL, detail: maskSecret(process.env.REDIS_URL) });
+
+  const activeProvider = (process.env.AI_PROVIDER as AIProviderId) || "kimi";
+  for (const pid of Object.keys(config.providers) as AIProviderId[]) {
+    const envKey = config.providers[pid].envKey;
+    const isActive = pid === activeProvider;
+    const set = !!process.env[envKey];
+    lines.push({
+      label: `${envKey}${isActive ? " (Provider فعال)" : ""}`,
+      ok: isActive ? set : true, // فقط برای provider فعال، نبودنش را «مشکل» حساب کن
+      detail: set ? maskSecret(process.env[envKey]) : (isActive ? "❌ تنظیم نشده" : "تنظیم نشده (استفاده نمی‌شود)"),
+    });
+  }
+
+  lines.push({ label: "TELEGRAM_WEBHOOK_SECRET", ok: true, detail: process.env.TELEGRAM_WEBHOOK_SECRET ? "تنظیم شده" : "تنظیم نشده (اختیاری، ولی توصیه می‌شود)" });
+  lines.push({ label: "ADMIN_IDS", ok: config.admin.ids.length > 0, detail: config.admin.ids.length > 0 ? config.admin.ids.join(", ") : "❌ خالی — هیچ‌کس دسترسی /admin ندارد" });
+  return lines;
+}
+
+function formatEnvDiagnosticsText(): string {
+  const lines = collectEnvDiagnostics();
+  const rows = lines.map((l) => `${l.ok ? "✅" : "⚠️"} <code>${l.label}</code>: ${l.detail}`);
+  return `🩺 <b>وضعیت متغیرهای محیطی</b>\n\n${rows.join("\n")}`;
+}
+
+/** در لاگ استارتاپ (قابل مشاهده در Railway → Deploy Logs) چاپ می‌شود تا مشکلات env بلافاصله معلوم شوند */
+function logStartupDiagnostics(): void {
+  const lines = collectEnvDiagnostics();
+  const problems = lines.filter((l) => !l.ok);
+  logger.info("Environment diagnostics", {
+    status: lines.map((l) => `${l.ok ? "OK" : "WARN"}:${l.label}=${l.detail}`),
+  });
+  if (problems.length > 0) {
+    logger.warn("برخی متغیرهای محیطی نیاز به توجه دارند", { problems: problems.map((p) => p.label) });
+  }
 }
 
 /* ---------------------------- Logger ---------------------------- */
@@ -738,9 +828,25 @@ async function callProvider(
   messages: ChatMessage[],
   opts: { stream?: boolean; onPartial?: (accumulated: string) => void } = {}
 ): Promise<ProviderCallResult> {
-  const providerConfig = config.providers[providerId];
-  const apiKey = process.env[providerConfig.envKey];
+  let providerConfig = config.providers[providerId];
+  let apiKey = process.env[providerConfig.envKey];
+  let effectiveModel = model;
+
+  // اگر کلید Provider انتخاب‌شده تنظیم نشده، به‌جای خطای کامل، به اولین Provider دیگری
+  // که کلیدش موجود است سوییچ کن (فقط یک‌بار هشدار در لاگ — نه هر پیام).
+  if (!apiKey) {
+    const fallbackId = (Object.keys(config.providers) as AIProviderId[]).find(
+      (pid) => pid !== providerId && !!process.env[config.providers[pid].envKey]
+    );
+    if (fallbackId) {
+      logger.warn(`Provider '${providerId}' env key (${providerConfig.envKey}) not set — falling back to '${fallbackId}'`);
+      providerConfig = config.providers[fallbackId];
+      apiKey = process.env[providerConfig.envKey];
+      effectiveModel = config.providers[fallbackId].defaultModel;
+    }
+  }
   if (!apiKey) throw new Error("PROVIDER_NOT_CONFIGURED");
+  model = effectiveModel;
 
   // OpenRouter برای رتبه‌بندی/شناسایی درخواست‌ها این دو هدر اختیاری را توصیه می‌کند
   const extraHeaders: Record<string, string> =
@@ -1179,6 +1285,7 @@ async function sendAdminMainMenu(chatId: number, messageId?: number): Promise<vo
     [{ text: "👥 مدیریت کاربران", callback_data: "adm:users", style: "primary" }],
     [{ text: "👨‍👩‍👧 مدیریت گروه‌ها", callback_data: "adm:groups", style: "primary" }],
     [{ text: "🧠 مدیریت مدل", callback_data: "adm:model", style: "success" }],
+    [{ text: "🩺 وضعیت متغیرهای محیطی", callback_data: "adm:diag", style: "success" }],
   ]);
   const text = "🛠 <b>پنل مدیریت النا</b>\n\nیکی از بخش‌ها رو انتخاب کن:";
   if (messageId) await editMessageText(chatId, messageId, text, kb);
@@ -1343,7 +1450,11 @@ Provider فعال: <b>${settings.aiProvider}</b>
 برای تغییر، از دکمه‌های زیر استفاده کن:
 `.trim();
   const kb = inlineKeyboard([
-    [{ text: "🔁 تغییر Provider به Kimi", callback_data: "adm:model:provider:kimi", style: "primary" }, { text: "🔁 تغییر Provider به Grok", callback_data: "adm:model:provider:grok", style: "primary" }],
+    [
+      { text: "🔁 Kimi", callback_data: "adm:model:provider:kimi", style: "primary" },
+      { text: "🔁 Grok", callback_data: "adm:model:provider:grok", style: "primary" },
+      { text: "🔁 OpenRouter", callback_data: "adm:model:provider:openrouter", style: "primary" },
+    ],
     [{ text: "✏️ تنظیم دستی نام مدل", callback_data: "adm:model:setmodel", style: "success" }],
     [{ text: "◀️ بازگشت", callback_data: "adm:main", style: "danger" }],
   ]);
@@ -1376,12 +1487,18 @@ async function handleAdminCallback(cq: TgCallbackQuery, data: string): Promise<b
     await sendMessage(chatId, "آیدی عددی گروه رو بفرست (با علامت منفی).");
     return true;
   }
+  if (data === "adm:diag") {
+    await editMessageText(chatId, messageId, formatEnvDiagnosticsText(), inlineKeyboard([[{ text: "🔄 تازه‌سازی", callback_data: "adm:diag", style: "primary" }], [{ text: "◀️ بازگشت", callback_data: "adm:main", style: "danger" }]]));
+    return true;
+  }
   if (data === "adm:model") { await sendModelMenu(chatId, messageId); return true; }
-  if (data === "adm:model:provider:kimi" || data === "adm:model:provider:grok") {
+  if (data === "adm:model:provider:kimi" || data === "adm:model:provider:grok" || data === "adm:model:provider:openrouter") {
     const providerId = parts[3] as AIProviderId;
     const updated = await updateBotSettings({ aiProvider: providerId, aiModel: config.providers[providerId].defaultModel });
     await sendModelMenu(chatId, messageId);
-    await answerCallbackQuery(cq.id, `Provider به ${providerId} تغییر کرد. مدل: ${updated.aiModel}`, true);
+    const keySet = !!process.env[config.providers[providerId].envKey];
+    const warning = keySet ? "" : ` ⚠️ توجه: ${config.providers[providerId].envKey} روی Railway تنظیم نشده — تا وقتی اضافه‌ش نکنی، ربات از یک Provider دیگر (که کلیدش موجوده) استفاده می‌کند.`;
+    await answerCallbackQuery(cq.id, `Provider به ${providerId} تغییر کرد. مدل: ${updated.aiModel}${warning}`, true);
     return true;
   }
   if (data === "adm:model:setmodel") {
@@ -1589,7 +1706,10 @@ app.post("/api/webhook", async (req, res) => {
 });
 
 const port = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
-app.listen(port, () => logger.info("Elena server is listening", { port }));
+app.listen(port, () => {
+  logger.info("Elena server is listening", { port });
+  logStartupDiagnostics();
+});
 
 const BOT_COMMANDS = [
   { command: "start", description: "شروع" },
