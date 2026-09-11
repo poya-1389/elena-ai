@@ -17,6 +17,7 @@ DAILY_LIMIT = 75
 WINDOW_4H_LIMIT = 30
 HISTORY_LIMIT = 16
 GROUP_COOLDOWN_SECONDS = 240
+UNAVAILABLE_MODELS = {"gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -124,9 +125,17 @@ class Database:
         )
 
     async def get_model(self, default: str = "gemini-3.6-flash") -> str:
-        return await self.get_setting("model", default) or default
+        model = await self.get_setting("model", default) or default
+        if model in UNAVAILABLE_MODELS:
+            logger.warning("Stored Gemini model %s is unavailable; using %s", model, default)
+            await self.set_model(default)
+            return default
+        return model
 
     async def set_model(self, model: str) -> None:
+        if model in UNAVAILABLE_MODELS:
+            logger.warning("Rejected unavailable Gemini model %s; using gemini-3.6-flash", model)
+            model = "gemini-3.6-flash"
         await self.set_setting("model", model)
 
     async def check_limit(self, chat_id: int, user_id: int) -> tuple[bool, int, int, int, int]:
