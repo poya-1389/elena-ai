@@ -31,7 +31,10 @@ from google.genai import types
 
 logger = logging.getLogger("elena.ai")
 
-MODEL_NAME = "gemini-2.5-flash"  # داخلی؛ به کاربر نمایش داده نمی‌شود
+MODEL_NAME = "gemini-3.6-flash"  # داخلی؛ به کاربر نمایش داده نمی‌شود
+# توجه: gemini-2.5-flash از 21 ژوئیه 2026 برای اکانت‌های جدید بازنشسته شده و
+# خودِ Gemini API با خطای 404 صراحتاً gemini-3.6-flash را به‌عنوان جایگزین
+# معرفی می‌کند؛ Free Tier مشابه (Rate-limited، بدون کارت اعتباری) را دارد.
 
 _client: genai.Client | None = None
 

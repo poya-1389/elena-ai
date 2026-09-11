@@ -17,6 +17,7 @@ import logging
 import os
 import random
 import re
+from collections import deque
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -28,6 +29,7 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
+    Update,
 )
 
 import ai
@@ -43,6 +45,33 @@ EDIT_THROTTLE_CHARS = 48  # حداقل رشد متن بین دو ویرایش پ
 db: Database
 bot_id: int = 0
 bot_username: str = ""
+
+_MAX_SEEN_UPDATES = 2000
+_seen_update_ids: deque[int] = deque()
+_seen_update_ids_set: set[int] = set()
+
+
+def _mark_seen(update_id: int) -> bool:
+    """ثبت یک update_id؛ اگر قبلاً دیده شده False برمی‌گرداند (یعنی تکراری است)."""
+    if update_id in _seen_update_ids_set:
+        return False
+    _seen_update_ids.append(update_id)
+    _seen_update_ids_set.add(update_id)
+    if len(_seen_update_ids) > _MAX_SEEN_UPDATES:
+        old = _seen_update_ids.popleft()
+        _seen_update_ids_set.discard(old)
+    return True
+
+
+async def dedup_outer_middleware(handler, event: Update, data: dict):
+    """
+    محافظ در برابر پردازش دوبرابر یک Update — چه دلیلش یک Deployment تکراری
+    باشد چه هر چیز دیگری. هر update_id فقط یک‌بار در طول عمر پروسه پردازش می‌شود.
+    """
+    if not _mark_seen(event.update_id):
+        logger.warning("Duplicate update_id=%s ignored", event.update_id)
+        return None
+    return await handler(event, data)
 
 
 def main_menu_kb() -> InlineKeyboardMarkup:
@@ -320,7 +349,11 @@ async def main() -> None:
     bot = Bot(token=bot_token, default=DefaultBotProperties(parse_mode=None))
     # اگر قبلاً (مثلاً در یک اجرای دیگر) Webhook روی این توکن تنظیم شده باشه،
     # getUpdates با خطای Conflict رد می‌شه؛ برای Polling باید همیشه پاکش کنیم.
-    await bot.delete_webhook(drop_pending_updates=True)
+    info_before = await bot.get_webhook_info()
+    logger.info("Webhook before cleanup: url=%r pending=%s", info_before.url, info_before.pending_update_count)
+    deleted = await bot.delete_webhook(drop_pending_updates=True)
+    info_after = await bot.get_webhook_info()
+    logger.info("delete_webhook() -> %s | Webhook after cleanup: url=%r", deleted, info_after.url)
     me = await bot.get_me()
     bot_id, bot_username = me.id, (me.username or "")
 
@@ -334,6 +367,7 @@ async def main() -> None:
     )
 
     dp = Dispatcher()
+    dp.update.outer_middleware(dedup_outer_middleware)
     register_handlers(dp)
 
     try:
