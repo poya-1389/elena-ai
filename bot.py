@@ -318,6 +318,9 @@ async def main() -> None:
     await db.connect()
 
     bot = Bot(token=bot_token, default=DefaultBotProperties(parse_mode=None))
+    # اگر قبلاً (مثلاً در یک اجرای دیگر) Webhook روی این توکن تنظیم شده باشه،
+    # getUpdates با خطای Conflict رد می‌شه؛ برای Polling باید همیشه پاکش کنیم.
+    await bot.delete_webhook(drop_pending_updates=True)
     me = await bot.get_me()
     bot_id, bot_username = me.id, (me.username or "")
 
