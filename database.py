@@ -15,8 +15,8 @@ logger = logging.getLogger("elena.database")
 
 DAILY_LIMIT = 75
 WINDOW_4H_LIMIT = 30
-HISTORY_LIMIT = 16  # تعداد پیام‌های اخیر هر چت که در Context نگه داشته می‌شود
-GROUP_COOLDOWN_SECONDS = 240  # فاصله‌ی حداقلی بین دو ورود خودکار النا به بحث یک گروه
+HISTORY_LIMIT = 16
+GROUP_COOLDOWN_SECONDS = 240
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -26,9 +26,6 @@ CREATE TABLE IF NOT EXISTS users (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     premium     BOOLEAN NOT NULL DEFAULT false
 );
-
--- فقط پیام‌هایی که AI واقعاً با موفقیت جوابشون رو داد اینجا ثبت می‌شن
--- (تا وقتی خطا می‌خوریم، مصرف کاربر بی‌خودی کم نشه)
 CREATE TABLE IF NOT EXISTS message_log (
     id          BIGSERIAL PRIMARY KEY,
     chat_id     BIGINT NOT NULL,
@@ -37,21 +34,24 @@ CREATE TABLE IF NOT EXISTS message_log (
 );
 CREATE INDEX IF NOT EXISTS idx_message_log_lookup
     ON message_log (chat_id, user_id, created_at);
-
 CREATE TABLE IF NOT EXISTS conversation (
     id          BIGSERIAL PRIMARY KEY,
     chat_id     BIGINT NOT NULL,
-    role        TEXT NOT NULL,          -- 'user' | 'model'
+    role        TEXT NOT NULL,
     author_name TEXT,
     content     TEXT NOT NULL,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_conversation_chat
     ON conversation (chat_id, created_at);
-
 CREATE TABLE IF NOT EXISTS group_cooldown (
     chat_id             BIGINT PRIMARY KEY,
     last_ambient_reply  TIMESTAMPTZ
+);
+CREATE TABLE IF NOT EXISTS app_settings (
+    key         TEXT PRIMARY KEY,
+    value       TEXT NOT NULL,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 """
 
@@ -70,8 +70,6 @@ class Database:
     async def close(self) -> None:
         if self.pool:
             await self.pool.close()
-
-    # ---------- کاربران ----------
 
     async def upsert_user(self, user_id: int, first_name: str, username: str | None) -> None:
         await self.pool.execute(
@@ -110,16 +108,33 @@ class Database:
         )
         return [dict(r) for r in rows]
 
-    # ---------- محدودیت پیام (فقط پیام‌های موفق شمرده می‌شوند) ----------
+    async def get_setting(self, key: str, default: str | None = None) -> str | None:
+        row = await self.pool.fetchrow("SELECT value FROM app_settings WHERE key=$1", key)
+        return row["value"] if row else default
+
+    async def set_setting(self, key: str, value: str) -> None:
+        await self.pool.execute(
+            """
+            INSERT INTO app_settings (key, value, updated_at)
+            VALUES ($1, $2, now())
+            ON CONFLICT (key) DO UPDATE
+                SET value = EXCLUDED.value, updated_at = now()
+            """,
+            key, value,
+        )
+
+    async def get_model(self, default: str = "gemini-3.6-flash") -> str:
+        return await self.get_setting("model", default) or default
+
+    async def set_model(self, model: str) -> None:
+        await self.set_setting("model", model)
 
     async def check_limit(self, chat_id: int, user_id: int) -> tuple[bool, int, int, int, int]:
-        """فقط بررسی می‌کند، چیزی ثبت نمی‌کند. خروجی: (allowed, used_today, limit_today, used_4h, limit_4h)."""
         used_today, used_4h = await self.get_usage(chat_id, user_id)
         allowed = used_today < DAILY_LIMIT and used_4h < WINDOW_4H_LIMIT
         return allowed, used_today, DAILY_LIMIT, used_4h, WINDOW_4H_LIMIT
 
     async def log_success(self, chat_id: int, user_id: int) -> None:
-        """فقط وقتی صدا زده شود که AI واقعاً پاسخ موفق تولید کرده باشد."""
         await self.pool.execute(
             "INSERT INTO message_log (chat_id, user_id) VALUES ($1, $2)", chat_id, user_id
         )
@@ -137,8 +152,6 @@ class Database:
             chat_id, user_id, four_h_ago,
         )
         return used_today, used_4h
-
-    # ---------- تاریخچه‌ی گفتگو ----------
 
     async def add_turn(self, chat_id: int, role: str, content: str, author_name: str | None = None) -> None:
         await self.pool.execute(
@@ -167,8 +180,6 @@ class Database:
 
     async def clear_history(self, chat_id: int) -> None:
         await self.pool.execute("DELETE FROM conversation WHERE chat_id=$1", chat_id)
-
-    # ---------- Cooldown حضور خودکار در گروه ----------
 
     async def ambient_cooldown_ok(self, chat_id: int) -> bool:
         row = await self.pool.fetchrow(
