@@ -1,9 +1,7 @@
 """
 bot.py — نقطه‌ی ورود ربات النا (Elena)
 
-Stack: Python 3.12+ / aiogram >= 3.31 (Bot API 10.3) / PostgreSQL (Railway) / Gemini 3.6 Flash
-
-تصمیم Polling در برابر Webhook: توضیح در نسخه‌های قبلی این فایل — همچنان Polling.
+Stack: Python 3.12+ / aiogram >= 3.31 / PostgreSQL / Gemini
 """
 
 from __future__ import annotations
@@ -42,6 +40,25 @@ AMBIENT_KEYWORDS = ("نظرت", "به نظر", "نظر شما", "نظرتون", 
 EDIT_THROTTLE_CHARS = 48
 TYPING_REFRESH_SECONDS = 4
 ADMIN_PAGE_SIZE = 6
+MODEL_PAGE_SIZE = 4
+
+# مدل‌های متنی/چندوجهی که برای generate_content مناسب‌اند.
+# مدل‌های Image / Live / TTS / Transcribe عمداً در این منو نیستند چون API فعلی Elena
+# برای پاسخ متنی طراحی شده و خروجی متنی می‌خواهد.
+GEMINI_MODELS = {
+    "gemini-3.8-flash": ("Gemini 3.8 Flash", "💎 بسیار قدرتمند — نسل جدید، مناسب کارهای سنگین و چندمرحله‌ای."),
+    "gemini-3.7-flash": ("Gemini 3.7 Flash", "🔥 بسیار قدرتمند — سریع و قوی برای کدنویسی و کارهای پیچیده."),
+    "gemini-3.6-flash": ("Gemini 3.6 Flash", "⭐ قدرتمند و متعادل — انتخاب پیش‌فرض خوب برای چت روزمره."),
+    "gemini-3.5-flash": ("Gemini 3.5 Flash", "⚡ معمولی/خوب — سریع‌تر و مناسب حجم بالای پیام‌های ساده."),
+    "gemini-3.5-flash-lite": ("Gemini 3.5 Flash-Lite", "🪶 سبک — سریع و اقتصادی، برای کارهای معمولی."),
+    "gemini-3.1-flash-lite": ("Gemini 3.1 Flash-Lite", "💨 سبک و اقتصادی — مناسب تعداد درخواست زیاد و کارهای ساده."),
+    "gemini-3.1-pro-preview": ("Gemini 3.1 Pro Preview", "🧠 بسیار قدرتمند — استدلال عمیق و کدنویسی؛ Preview است."),
+    "gemini-3-flash-preview": ("Gemini 3 Flash Preview", "🚀 بسیار قدرتمند — سرعت بالا با توانایی استدلال قوی؛ Preview است."),
+    "gemini-2.5-pro": ("Gemini 2.5 Pro", "🧠 قدرتمند — مدل حرفه‌ای 2.5 برای استدلال و کدنویسی پیچیده."),
+    "gemini-2.5-flash": ("Gemini 2.5 Flash", "⚖️ متعادل — نسبت قیمت/توان خوب و مناسب کارهای عمومی."),
+    "gemini-2.5-flash-lite": ("Gemini 2.5 Flash-Lite", "🪶 سبک — سریع‌ترین/اقتصادی‌ترین انتخاب خانواده 2.5."),
+}
+DEFAULT_MODEL = "gemini-3.6-flash"
 
 REACT_RE = re.compile(r"^\s*REACT:\s*(\S+)\s*\n?")
 GROUP_JOIN_TEXT = (
@@ -54,9 +71,6 @@ bot_id: int = 0
 bot_username: str = ""
 admin_id: int | None = None
 
-# ---------------------------------------------------------------------------
-# محافظ در برابر پردازش دوبرابر یک Update
-# ---------------------------------------------------------------------------
 _MAX_SEEN_UPDATES = 2000
 _seen_update_ids: deque[int] = deque()
 _seen_update_ids_set: set[int] = set()
@@ -86,14 +100,9 @@ def is_admin(user_id: int | None) -> bool:
 
 def group_button_kb() -> InlineKeyboardMarkup:
     url = f"https://t.me/{bot_username}?startgroup=true"
-    return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="+ افزودن به گروه", url=url, style="primary")]]
-    )
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="+ افزودن به گروه", url=url, style="primary")]])
 
 
-# ---------------------------------------------------------------------------
-# تبدیل خروجی Markdown-ایِ مدل به HTML موردقبول تلگرام
-# ---------------------------------------------------------------------------
 def markdown_to_telegram_html(text: str) -> str:
     out = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     out = re.sub(r"```(\w*)\n(.*?)```", lambda m: f"<pre><code>{m.group(2)}</code></pre>", out, flags=re.DOTALL)
@@ -117,9 +126,7 @@ def is_direct_mode(message: Message) -> bool:
     if message.chat.type == "private":
         return True
     text = message.text or message.caption or ""
-    if message.reply_to_message and message.reply_to_message.from_user and (
-        message.reply_to_message.from_user.id == bot_id
-    ):
+    if message.reply_to_message and message.reply_to_message.from_user and message.reply_to_message.from_user.id == bot_id:
         return True
     if bot_username and f"@{bot_username.lower()}" in text.lower():
         return True
@@ -149,7 +156,7 @@ async def _typing_loop(bot: Bot, chat_id: int, stop_event: asyncio.Event) -> Non
     while not stop_event.is_set():
         try:
             await bot.send_chat_action(chat_id, ChatAction.TYPING)
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=TYPING_REFRESH_SECONDS)
@@ -159,11 +166,7 @@ async def _typing_loop(bot: Bot, chat_id: int, stop_event: asyncio.Event) -> Non
 
 async def _try_react(message: Message, emoji: str) -> None:
     try:
-        await message.bot.set_message_reaction(
-            chat_id=message.chat.id,
-            message_id=message.message_id,
-            reaction=[ReactionTypeEmoji(type="emoji", emoji=emoji)],
-        )
+        await message.bot.set_message_reaction(chat_id=message.chat.id, message_id=message.message_id, reaction=[ReactionTypeEmoji(type="emoji", emoji=emoji)])
     except (TelegramBadRequest, TelegramForbiddenError) as exc:
         logger.info("Reaction %r rejected: %s", emoji, exc)
 
@@ -177,39 +180,28 @@ async def stream_reply(message: Message, user_text: str, media: list[tuple[bytes
     allowed, used_today, limit_today, used_4h, limit_4h = await db.check_limit(chat_id, user.id)
     if not allowed:
         if is_group:
-            return  # در گروه بی‌سروصدا رد شو
-        await message.answer(
-            "امروز به سقف پیام‌هات رسیدی. یکم بعد دوباره بیا 🙂\n"
-            f"({used_today}/{limit_today} امروز — {used_4h}/{limit_4h} این ۴ ساعت اخیر)"
-        )
+            return
+        await message.answer("امروز به سقف پیام‌هات رسیدی. یکم بعد دوباره بیا 🙂\n" f"({used_today}/{limit_today} امروز — {used_4h}/{limit_4h} این ۴ ساعت اخیر)")
         return
 
     await db.upsert_user(user.id, user.first_name, user.username)
     history = await db.get_history(chat_id)
-
     stop_typing = asyncio.Event()
     typing_task = asyncio.create_task(_typing_loop(message.bot, chat_id, stop_typing))
-
     buffer = ""
     last_edit_len = 0
     had_error = False
     placeholder: Message | None = None
     reaction_checked = False
-
     send = message.reply if is_group else message.answer
 
     try:
-        async for chunk in ai.generate_reply_stream(
-            history=history, user_text=user_text, author_name=author_name, media=media
-        ):
+        async for chunk in ai.generate_reply_stream(history=history, user_text=user_text, author_name=author_name, media=media):
             if chunk == "__ELENA_AI_ERROR__":
                 had_error = True
                 break
             buffer += chunk
-
             if not reaction_checked:
-                # منتظر می‌مونیم تا یا یه REACT کامل ببینیم یا بافر به اندازه‌ی کافی
-                # بزرگ بشه که مطمئن بشیم دیگه REACT نیست
                 m = REACT_RE.match(buffer)
                 if m:
                     await _try_react(message, m.group(1))
@@ -217,13 +209,8 @@ async def stream_reply(message: Message, user_text: str, media: list[tuple[bytes
                     reaction_checked = True
                 elif len(buffer) > 24 or "\n" in buffer:
                     reaction_checked = True
-
-            if not reaction_checked:
+            if not reaction_checked or not buffer.strip():
                 continue
-
-            if not buffer.strip():
-                continue
-
             if placeholder is None:
                 placeholder = await send("…")
             elif len(buffer) - last_edit_len >= EDIT_THROTTLE_CHARS:
@@ -249,7 +236,6 @@ async def stream_reply(message: Message, user_text: str, media: list[tuple[bytes
         return
 
     if not buffer.strip():
-        # فقط Reaction بود، متن اضافه‌ای لازم نیست
         if placeholder is not None:
             try:
                 await placeholder.delete()
@@ -279,7 +265,6 @@ async def stream_reply(message: Message, user_text: str, media: list[tuple[bytes
     await db.add_turn(chat_id, "user", user_text, author_name=author_name)
     await db.add_turn(chat_id, "model", buffer)
     await db.log_success(chat_id, user.id)
-
     if is_group:
         await db.mark_ambient_reply(chat_id)
 
@@ -299,17 +284,21 @@ def _admin_list_kb(users: list[dict], page: int, total: int) -> InlineKeyboardMa
         nav.append(InlineKeyboardButton(text="بعدی ▶️", callback_data=f"adm_p:{page+1}"))
     if nav:
         rows.append(nav)
+    rows.append([InlineKeyboardButton(text="🤖 انتخاب مدل Gemini", callback_data="adm_models:0")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def _render_admin_list(page: int) -> tuple[str, InlineKeyboardMarkup]:
     total = await db.count_users()
     premium_count = await db.count_premium()
+    model = await db.get_model(DEFAULT_MODEL)
     users = await db.list_users(ADMIN_PAGE_SIZE, page * ADMIN_PAGE_SIZE)
+    model_title = GEMINI_MODELS.get(model, (model, "مدل سفارشی"))[0]
     text = (
         "🛠 <b>پنل مدیریت Elena</b>\n\n"
         f"کل کاربران: <b>{total}</b>\n"
-        f"مشترک‌های فعال: <b>{premium_count}</b>\n\n"
+        f"مشترک‌های فعال: <b>{premium_count}</b>\n"
+        f"مدل فعلی برای همه: <b>{model_title}</b>\n\n"
         f"صفحه‌ی {page + 1} — روی هر کاربر بزن برای مدیریت:"
     )
     return text, _admin_list_kb(users, page, total)
@@ -320,35 +309,52 @@ async def _render_admin_user(user_id: int, page: int) -> tuple[str, InlineKeyboa
     if not u:
         return "کاربر پیدا نشد.", _admin_list_kb([], page, 0)
     status = "⭐ مشترک" if u["premium"] else "▫️ بدون اشتراک"
-    text = (
-        f"👤 <b>{u['first_name'] or '—'}</b>\n"
-        + (f"یوزرنیم: @{u['username']}\n" if u["username"] else "")
-        + f"آیدی: <code>{u['user_id']}</code>\n"
-        + f"عضویت از: {u['created_at'].strftime('%Y-%m-%d')}\n"
-        + f"وضعیت: {status}"
-    )
+    text = f"👤 <b>{u['first_name'] or '—'}</b>\n" + (f"یوزرنیم: @{u['username']}\n" if u["username"] else "") + f"آیدی: <code>{u['user_id']}</code>\n" + f"عضویت از: {u['created_at'].strftime('%Y-%m-%d')}\n" + f"وضعیت: {status}"
     toggle_text = "❌ لغو اشتراک" if u["premium"] else "⭐ فعال‌سازی اشتراک"
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=toggle_text, callback_data=f"adm_t:{user_id}:{page}")],
-            [InlineKeyboardButton(text="◀️ بازگشت به لیست", callback_data=f"adm_p:{page}")],
-        ]
-    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=toggle_text, callback_data=f"adm_t:{user_id}:{page}")],
+        [InlineKeyboardButton(text="◀️ بازگشت به لیست", callback_data=f"adm_p:{page}")],
+    ])
     return text, kb
 
 
-def register_handlers(dp: Dispatcher) -> None:
+def _model_kb(page: int, current: str) -> InlineKeyboardMarkup:
+    items = list(GEMINI_MODELS.items())
+    start = page * MODEL_PAGE_SIZE
+    rows = []
+    for model, (title, _) in items[start:start + MODEL_PAGE_SIZE]:
+        mark = "✅ " if model == current else ""
+        rows.append([InlineKeyboardButton(text=mark + title, callback_data=f"adm_m:{model}:{page}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️ قبلی", callback_data=f"adm_models:{page-1}"))
+    if start + MODEL_PAGE_SIZE < len(items):
+        nav.append(InlineKeyboardButton(text="بعدی ▶️", callback_data=f"adm_models:{page+1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="◀️ بازگشت به پنل", callback_data="adm_back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
+
+async def _render_models(page: int) -> tuple[str, InlineKeyboardMarkup]:
+    current = await db.get_model(DEFAULT_MODEL)
+    title, desc = GEMINI_MODELS.get(current, (current, "مدل سفارشی"))
+    text = (
+        "🤖 <b>انتخاب مدل Gemini</b>\n\n"
+        f"مدل فعال برای <b>همه کاربران</b>:\n<b>{title}</b>\n{desc}\n\n"
+        "با انتخاب هر مدل، از این لحظه درخواست‌های جدید همه کاربران با همان مدل اجرا می‌شود.\n"
+        "⚠️ مدل‌های تخصصی تصویر/صدا در این فهرست نیستند چون هسته‌ی Elena پاسخ متنی تولید می‌کند."
+    )
+    return text, _model_kb(page, current)
+
+
+def register_handlers(dp: Dispatcher) -> None:
     @dp.message(CommandStart())
     async def cmd_start(message: Message) -> None:
         await db.upsert_user(message.from_user.id, message.from_user.first_name, message.from_user.username)
         if message.chat.type == "private":
             name = message.from_user.first_name
-            text = (
-                f"سلام، {name}\n\n"
-                "من النا - Elena هستم. می‌تونی اینجا بهم پیام بدی یا من رو به یک گروه اضافه کنی.\n\n"
-                "من پیام‌های صوتی، عکس‌ها و فایل‌های PDF رو می‌فهمم. درباره هر چیزی که می‌خوای بنویس."
-            )
+            text = f"سلام، {name}\n\nمن النا - Elena هستم. می‌تونی اینجا بهم پیام بدی یا من رو به یک گروه اضافه کنی.\n\nمن پیام‌های صوتی، عکس‌ها و فایل‌های PDF رو می‌فهمم. درباره هر چیزی که می‌خوای بنویس."
         else:
             text = GROUP_JOIN_TEXT
         await message.answer(text, reply_markup=group_button_kb())
@@ -378,7 +384,7 @@ def register_handlers(dp: Dispatcher) -> None:
     @dp.message(Command("admin"))
     async def cmd_admin(message: Message) -> None:
         if not is_admin(message.from_user.id):
-            return  # برای بقیه کاملاً بی‌صداست
+            return
         text, kb = await _render_admin_list(0)
         await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
@@ -389,8 +395,20 @@ def register_handlers(dp: Dispatcher) -> None:
             return
         action, _, rest = call.data.partition(":")
         if action == "adm_p":
-            page = int(rest)
-            text, kb = await _render_admin_list(page)
+            text, kb = await _render_admin_list(int(rest))
+        elif action == "adm_back":
+            text, kb = await _render_admin_list(0)
+        elif action == "adm_models":
+            text, kb = await _render_models(int(rest or 0))
+        elif action == "adm_m":
+            model, _, page_str = rest.partition(":")
+            if model not in GEMINI_MODELS:
+                await call.answer("این مدل در فهرست مجاز نیست.", show_alert=True)
+                return
+            await db.set_model(model)
+            ai.MODEL_NAME = model
+            text, kb = await _render_models(int(page_str or 0))
+            await call.answer("مدل برای همه کاربران تغییر کرد ✅")
         elif action == "adm_u":
             uid_str, _, page_str = rest.partition(":")
             text, kb = await _render_admin_user(int(uid_str), int(page_str))
@@ -407,7 +425,8 @@ def register_handlers(dp: Dispatcher) -> None:
             await call.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
         except TelegramBadRequest:
             pass
-        await call.answer()
+        if not call.data.startswith("adm_m:"):
+            await call.answer()
 
     @dp.message(F.voice)
     async def on_voice(message: Message) -> None:
@@ -433,46 +452,31 @@ def register_handlers(dp: Dispatcher) -> None:
                 await message.answer("فعلاً فقط PDF رو می‌فهمم، نه این نوع فایل رو.")
             return
         data = await download_bytes(message.bot, doc.file_id)
-        await stream_reply(
-            message, message.caption or "این PDF رو بخون و خلاصه‌اش کن.", media=[(data, "application/pdf")]
-        )
+        await stream_reply(message, message.caption or "این PDF رو بخون و خلاصه‌اش کن.", media=[(data, "application/pdf")])
 
     @dp.message(F.text)
     async def on_text(message: Message) -> None:
         text = message.text
         chat_type = message.chat.type
-
         if chat_type == "private":
             await stream_reply(message, text)
             return
-
         if is_direct_mode(message):
             await stream_reply(message, text)
             return
-
         await db.add_turn(message.chat.id, "user", text, author_name=author_label(message))
-
         if not is_ambient_worthy(text):
             return
         if not await db.ambient_cooldown_ok(message.chat.id):
             return
         if random.random() > AMBIENT_PROBABILITY:
             return
-
-        await db.pool.execute(
-            """
-            DELETE FROM conversation WHERE id = (
-                SELECT id FROM conversation WHERE chat_id=$1 ORDER BY created_at DESC LIMIT 1
-            )
-            """,
-            message.chat.id,
-        )
+        await db.pool.execute("DELETE FROM conversation WHERE id = (SELECT id FROM conversation WHERE chat_id=$1 ORDER BY created_at DESC LIMIT 1)", message.chat.id)
         await stream_reply(message, text)
 
 
 async def main() -> None:
     global db, bot_id, bot_username, admin_id
-
     bot_token = os.environ["BOT_TOKEN"]
     database_url = os.environ["DATABASE_URL"]
     admin_id_raw = os.environ.get("ADMIN_ID")
@@ -481,34 +485,33 @@ async def main() -> None:
     ai.init_client()
     db = Database(database_url)
     await db.connect()
+    ai.MODEL_NAME = await db.get_model(DEFAULT_MODEL)
+    if ai.MODEL_NAME not in GEMINI_MODELS:
+        logger.warning("Unknown stored model %s; falling back to %s", ai.MODEL_NAME, DEFAULT_MODEL)
+        ai.MODEL_NAME = DEFAULT_MODEL
+        await db.set_model(DEFAULT_MODEL)
 
     bot = Bot(token=bot_token, default=DefaultBotProperties(parse_mode=None))
     await bot.delete_webhook(drop_pending_updates=True)
     me = await bot.get_me()
     bot_id, bot_username = me.id, (me.username or "")
 
-    await bot.set_my_commands(
-        [
+    await bot.set_my_commands([
+        {"command": "start", "description": "Start — Restart Elna"},
+        {"command": "stats", "description": "Consumption status"},
+        {"command": "premium", "description": "Upgrade subscription"},
+    ])
+    if admin_id:
+        await bot.set_my_commands([
             {"command": "start", "description": "Start — Restart Elna"},
             {"command": "stats", "description": "Consumption status"},
             {"command": "premium", "description": "Upgrade subscription"},
-        ]
-    )
-    if admin_id:
-        await bot.set_my_commands(
-            [
-                {"command": "start", "description": "Start — Restart Elna"},
-                {"command": "stats", "description": "Consumption status"},
-                {"command": "premium", "description": "Upgrade subscription"},
-                {"command": "admin", "description": "پنل مدیریت"},
-            ],
-            scope=BotCommandScopeChat(chat_id=admin_id),
-        )
+            {"command": "admin", "description": "پنل مدیریت"},
+        ], scope=BotCommandScopeChat(chat_id=admin_id))
 
     dp = Dispatcher()
     dp.update.outer_middleware(dedup_outer_middleware)
     register_handlers(dp)
-
     try:
         await dp.start_polling(bot, allowed_updates=["message", "callback_query", "my_chat_member"])
     finally:
