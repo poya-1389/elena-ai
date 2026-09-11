@@ -2,12 +2,6 @@
 database.py — لایه‌ی دیتابیس النا (Elena)
 
 از PostgreSQL روی Railway استفاده می‌کند (asyncpg، بدون ORM سنگین).
-مسئولیت‌ها:
-    - ساخت جدول‌ها در startup
-    - محدودیت پیام (75/روز ، 30/۴ساعت) — بدون race condition (شمارش اتمیک با COUNT در تراکنش)
-    - تاریخچه‌ی گفتگو (per chat، محدود به آخرین N پیام)
-    - cooldown برای ورود خودکار النا به بحث گروه‌ها
-    - حافظه‌ی سبک کاربر (/forget قابل پاک‌کردن)
 """
 
 from __future__ import annotations
@@ -33,6 +27,8 @@ CREATE TABLE IF NOT EXISTS users (
     premium     BOOLEAN NOT NULL DEFAULT false
 );
 
+-- فقط پیام‌هایی که AI واقعاً با موفقیت جوابشون رو داد اینجا ثبت می‌شن
+-- (تا وقتی خطا می‌خوریم، مصرف کاربر بی‌خودی کم نشه)
 CREATE TABLE IF NOT EXISTS message_log (
     id          BIGSERIAL PRIMARY KEY,
     chat_id     BIGINT NOT NULL,
@@ -57,14 +53,6 @@ CREATE TABLE IF NOT EXISTS group_cooldown (
     chat_id             BIGINT PRIMARY KEY,
     last_ambient_reply  TIMESTAMPTZ
 );
-
-CREATE TABLE IF NOT EXISTS memory_note (
-    id          BIGSERIAL PRIMARY KEY,
-    user_id     BIGINT NOT NULL,
-    note        TEXT NOT NULL,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS idx_memory_user ON memory_note (user_id);
 """
 
 
@@ -101,44 +89,40 @@ class Database:
         row = await self.pool.fetchrow("SELECT premium FROM users WHERE user_id=$1", user_id)
         return bool(row and row["premium"])
 
-    # ---------- محدودیت پیام (اتمیک) ----------
+    async def get_user(self, user_id: int) -> dict | None:
+        row = await self.pool.fetchrow("SELECT * FROM users WHERE user_id=$1", user_id)
+        return dict(row) if row else None
 
-    async def register_message_and_check_limit(
-        self, chat_id: int, user_id: int
-    ) -> tuple[bool, int, int, int, int]:
-        """
-        یک پیام را ثبت می‌کند و همزمان محدودیت را در یک تراکنش بررسی می‌کند
-        (INSERT + COUNT در یک تراکنش، برای جلوگیری از race condition).
+    async def set_premium(self, user_id: int, value: bool) -> None:
+        await self.pool.execute("UPDATE users SET premium=$2 WHERE user_id=$1", user_id, value)
 
-        خروجی: (allowed, used_today, limit_today, used_4h, limit_4h)
-        """
-        limit_today = DAILY_LIMIT
-        limit_4h = WINDOW_4H_LIMIT
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                now = datetime.now(timezone.utc)
-                day_ago = now - timedelta(hours=24)
-                four_h_ago = now - timedelta(hours=4)
+    async def count_users(self) -> int:
+        return await self.pool.fetchval("SELECT count(*) FROM users")
 
-                used_today = await conn.fetchval(
-                    "SELECT count(*) FROM message_log WHERE chat_id=$1 AND user_id=$2 AND created_at > $3",
-                    chat_id, user_id, day_ago,
-                )
-                used_4h = await conn.fetchval(
-                    "SELECT count(*) FROM message_log WHERE chat_id=$1 AND user_id=$2 AND created_at > $3",
-                    chat_id, user_id, four_h_ago,
-                )
+    async def count_premium(self) -> int:
+        return await self.pool.fetchval("SELECT count(*) FROM users WHERE premium=true")
 
-                allowed = used_today < limit_today and used_4h < limit_4h
-                if allowed:
-                    await conn.execute(
-                        "INSERT INTO message_log (chat_id, user_id) VALUES ($1, $2)",
-                        chat_id, user_id,
-                    )
-                    used_today += 1
-                    used_4h += 1
+    async def list_users(self, limit: int, offset: int) -> list[dict]:
+        rows = await self.pool.fetch(
+            "SELECT user_id, first_name, username, premium, created_at FROM users "
+            "ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+            limit, offset,
+        )
+        return [dict(r) for r in rows]
 
-        return allowed, used_today, limit_today, used_4h, limit_4h
+    # ---------- محدودیت پیام (فقط پیام‌های موفق شمرده می‌شوند) ----------
+
+    async def check_limit(self, chat_id: int, user_id: int) -> tuple[bool, int, int, int, int]:
+        """فقط بررسی می‌کند، چیزی ثبت نمی‌کند. خروجی: (allowed, used_today, limit_today, used_4h, limit_4h)."""
+        used_today, used_4h = await self.get_usage(chat_id, user_id)
+        allowed = used_today < DAILY_LIMIT and used_4h < WINDOW_4H_LIMIT
+        return allowed, used_today, DAILY_LIMIT, used_4h, WINDOW_4H_LIMIT
+
+    async def log_success(self, chat_id: int, user_id: int) -> None:
+        """فقط وقتی صدا زده شود که AI واقعاً پاسخ موفق تولید کرده باشد."""
+        await self.pool.execute(
+            "INSERT INTO message_log (chat_id, user_id) VALUES ($1, $2)", chat_id, user_id
+        )
 
     async def get_usage(self, chat_id: int, user_id: int) -> tuple[int, int]:
         now = datetime.now(timezone.utc)
@@ -161,7 +145,6 @@ class Database:
             "INSERT INTO conversation (chat_id, role, author_name, content) VALUES ($1, $2, $3, $4)",
             chat_id, role, author_name, content,
         )
-        # نگه‌داشتن فقط آخرین HISTORY_LIMIT پیام هر چت (پاک‌سازی سبک، بدون رشد نامحدود)
         await self.pool.execute(
             """
             DELETE FROM conversation
@@ -181,6 +164,9 @@ class Database:
             chat_id, limit,
         )
         return [dict(r) for r in reversed(rows)]
+
+    async def clear_history(self, chat_id: int) -> None:
+        await self.pool.execute("DELETE FROM conversation WHERE chat_id=$1", chat_id)
 
     # ---------- Cooldown حضور خودکار در گروه ----------
 
@@ -202,20 +188,3 @@ class Database:
             """,
             chat_id,
         )
-
-    # ---------- حافظه‌ی سبک کاربر ----------
-
-    async def add_memory_note(self, user_id: int, note: str) -> None:
-        await self.pool.execute(
-            "INSERT INTO memory_note (user_id, note) VALUES ($1, $2)", user_id, note
-        )
-
-    async def get_memory_notes(self, user_id: int, limit: int = 20) -> list[str]:
-        rows = await self.pool.fetch(
-            "SELECT note FROM memory_note WHERE user_id=$1 ORDER BY created_at DESC LIMIT $2",
-            user_id, limit,
-        )
-        return [r["note"] for r in rows]
-
-    async def forget_user(self, user_id: int) -> None:
-        await self.pool.execute("DELETE FROM memory_note WHERE user_id=$1", user_id)

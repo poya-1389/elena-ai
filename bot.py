@@ -1,13 +1,9 @@
 """
 bot.py — نقطه‌ی ورود ربات النا (Elena)
 
-Stack: Python 3.12+ / aiogram >= 3.31 (Bot API 10.3) / PostgreSQL (Railway) / Gemini 2.5 Flash
+Stack: Python 3.12+ / aiogram >= 3.31 (Bot API 10.3) / PostgreSQL (Railway) / Gemini 3.6 Flash
 
-تصمیم Polling در برابر Webhook:
-    Polling انتخاب شد. روی Railway، پروسه به‌صورت دائمی (Long-running worker) اجرا
-    می‌شود نه Serverless، پس مزیت اصلی Webhook (بیدار شدن on-demand) اینجا بی‌فایده
-    است؛ در عوض Polling نیاز به سرور HTTP/SSL/دامنه ندارد، پیاده‌سازی‌اش خطای کمتری
-    دارد و برای یک پروژه با محدودیت «حداکثر ۴ فایل» ساده‌تر و پایدارتر است.
+تصمیم Polling در برابر Webhook: توضیح در نسخه‌های قبلی این فایل — همچنان Polling.
 """
 
 from __future__ import annotations
@@ -22,13 +18,16 @@ from collections import deque
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatAction, ParseMode
-from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
+    BotCommandScopeChat,
     CallbackQuery,
+    ChatMemberUpdated,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
+    ReactionTypeEmoji,
     Update,
 )
 
@@ -40,19 +39,30 @@ logger = logging.getLogger("elena.bot")
 
 AMBIENT_PROBABILITY = 0.3
 AMBIENT_KEYWORDS = ("نظرت", "به نظر", "نظر شما", "نظرتون", "فکر می‌کنی", "فکر میکنی", "نظرتو")
-EDIT_THROTTLE_CHARS = 48  # حداقل رشد متن بین دو ویرایش پیام، برای جلوگیری از Flood
+EDIT_THROTTLE_CHARS = 48
+TYPING_REFRESH_SECONDS = 4
+ADMIN_PAGE_SIZE = 6
+
+REACT_RE = re.compile(r"^\s*REACT:\s*(\S+)\s*\n?")
+GROUP_JOIN_TEXT = (
+    "سلام من النا - Elena هستم. اینجا می‌تونی با صدازدن، ریپلای و منشن کردن بهم پیام بدی.\n\n"
+    "من پیام‌های صوتی، عکس‌ها و فایل‌های PDF رو می‌فهمم. درباره هر چیزی که می‌خوای بنویس."
+)
 
 db: Database
 bot_id: int = 0
 bot_username: str = ""
+admin_id: int | None = None
 
+# ---------------------------------------------------------------------------
+# محافظ در برابر پردازش دوبرابر یک Update
+# ---------------------------------------------------------------------------
 _MAX_SEEN_UPDATES = 2000
 _seen_update_ids: deque[int] = deque()
 _seen_update_ids_set: set[int] = set()
 
 
 def _mark_seen(update_id: int) -> bool:
-    """ثبت یک update_id؛ اگر قبلاً دیده شده False برمی‌گرداند (یعنی تکراری است)."""
     if update_id in _seen_update_ids_set:
         return False
     _seen_update_ids.append(update_id)
@@ -64,46 +74,29 @@ def _mark_seen(update_id: int) -> bool:
 
 
 async def dedup_outer_middleware(handler, event: Update, data: dict):
-    """
-    محافظ در برابر پردازش دوبرابر یک Update — چه دلیلش یک Deployment تکراری
-    باشد چه هر چیز دیگری. هر update_id فقط یک‌بار در طول عمر پروسه پردازش می‌شود.
-    """
     if not _mark_seen(event.update_id):
         logger.warning("Duplicate update_id=%s ignored", event.update_id)
         return None
     return await handler(event, data)
 
 
-def main_menu_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="✨ گفتگوی جدید", callback_data="new_chat")],
-            [InlineKeyboardButton(text="📊 وضعیت", callback_data="stats")],
-            [InlineKeyboardButton(text="⭐ Premium", callback_data="premium")],
-        ]
-    )
+def is_admin(user_id: int | None) -> bool:
+    return admin_id is not None and user_id == admin_id
 
 
-def memory_menu_kb() -> InlineKeyboardMarkup:
+def group_button_kb() -> InlineKeyboardMarkup:
+    url = f"https://t.me/{bot_username}?startgroup=true"
     return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="🗑 پاک کردن حافظه", callback_data="clear_memory")]]
+        inline_keyboard=[[InlineKeyboardButton(text="+ افزودن به گروه", url=url, style="primary")]]
     )
 
 
 # ---------------------------------------------------------------------------
-# تبدیل خروجی Markdown-ایِ مدل به HTML موردقبول تلگرام (فرمت رسمی)
+# تبدیل خروجی Markdown-ایِ مدل به HTML موردقبول تلگرام
 # ---------------------------------------------------------------------------
 def markdown_to_telegram_html(text: str) -> str:
-    # ابتدا escape کاراکترهای خاص HTML
     out = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-    # بلوک کد ```lang\n...\n```
-    out = re.sub(
-        r"```(\w*)\n(.*?)```",
-        lambda m: f"<pre><code>{m.group(2)}</code></pre>",
-        out,
-        flags=re.DOTALL,
-    )
+    out = re.sub(r"```(\w*)\n(.*?)```", lambda m: f"<pre><code>{m.group(2)}</code></pre>", out, flags=re.DOTALL)
     out = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", out)
     out = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", out)
     out = re.sub(r"(?<!\*)\*(?!\*)(.+?)\*(?!\*)", r"<i>\1</i>", out)
@@ -144,17 +137,47 @@ def is_ambient_worthy(text: str) -> bool:
     return any(k in t for k in AMBIENT_KEYWORDS)
 
 
+def author_label(message: Message) -> str | None:
+    if message.chat.type == "private":
+        return None
+    user = message.from_user
+    name = user.first_name or (user.username or "کاربر")
+    return f"{name} [ربات]" if user.is_bot else name
+
+
+async def _typing_loop(bot: Bot, chat_id: int, stop_event: asyncio.Event) -> None:
+    while not stop_event.is_set():
+        try:
+            await bot.send_chat_action(chat_id, ChatAction.TYPING)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=TYPING_REFRESH_SECONDS)
+        except asyncio.TimeoutError:
+            pass
+
+
+async def _try_react(message: Message, emoji: str) -> None:
+    try:
+        await message.bot.set_message_reaction(
+            chat_id=message.chat.id,
+            message_id=message.message_id,
+            reaction=[ReactionTypeEmoji(type="emoji", emoji=emoji)],
+        )
+    except (TelegramBadRequest, TelegramForbiddenError) as exc:
+        logger.info("Reaction %r rejected: %s", emoji, exc)
+
+
 async def stream_reply(message: Message, user_text: str, media: list[tuple[bytes, str]] | None = None) -> None:
     chat_id = message.chat.id
     user = message.from_user
-    author_name = user.first_name if message.chat.type != "private" else None
+    is_group = message.chat.type != "private"
+    author_name = author_label(message)
 
-    allowed, used_today, limit_today, used_4h, limit_4h = await db.register_message_and_check_limit(
-        chat_id, user.id
-    )
+    allowed, used_today, limit_today, used_4h, limit_4h = await db.check_limit(chat_id, user.id)
     if not allowed:
-        if message.chat.type != "private":
-            return  # در گروه، بی‌سروصدا رد شو تا اسپم نشه
+        if is_group:
+            return  # در گروه بی‌سروصدا رد شو
         await message.answer(
             "امروز به سقف پیام‌هات رسیدی. یکم بعد دوباره بیا 🙂\n"
             f"({used_today}/{limit_today} امروز — {used_4h}/{limit_4h} این ۴ ساعت اخیر)"
@@ -163,59 +186,155 @@ async def stream_reply(message: Message, user_text: str, media: list[tuple[bytes
 
     await db.upsert_user(user.id, user.first_name, user.username)
     history = await db.get_history(chat_id)
-    memory_notes = await db.get_memory_notes(user.id) if message.chat.type == "private" else None
 
-    try:
-        await message.bot.send_chat_action(chat_id, ChatAction.TYPING)
-    except Exception:  # noqa: BLE001
-        pass
+    stop_typing = asyncio.Event()
+    typing_task = asyncio.create_task(_typing_loop(message.bot, chat_id, stop_typing))
 
-    placeholder = await message.answer("…")
     buffer = ""
     last_edit_len = 0
     had_error = False
+    placeholder: Message | None = None
+    reaction_checked = False
 
-    async for chunk in ai.generate_reply_stream(
-        history=history,
-        user_text=user_text,
-        author_name=author_name,
-        media=media,
-        memory_notes=memory_notes,
-    ):
-        if chunk == "__ELENA_AI_ERROR__":
-            had_error = True
-            break
-        buffer += chunk
-        if len(buffer) - last_edit_len >= EDIT_THROTTLE_CHARS:
+    send = message.reply if is_group else message.answer
+
+    try:
+        async for chunk in ai.generate_reply_stream(
+            history=history, user_text=user_text, author_name=author_name, media=media
+        ):
+            if chunk == "__ELENA_AI_ERROR__":
+                had_error = True
+                break
+            buffer += chunk
+
+            if not reaction_checked:
+                # منتظر می‌مونیم تا یا یه REACT کامل ببینیم یا بافر به اندازه‌ی کافی
+                # بزرگ بشه که مطمئن بشیم دیگه REACT نیست
+                m = REACT_RE.match(buffer)
+                if m:
+                    await _try_react(message, m.group(1))
+                    buffer = buffer[m.end():]
+                    reaction_checked = True
+                elif len(buffer) > 24 or "\n" in buffer:
+                    reaction_checked = True
+
+            if not reaction_checked:
+                continue
+
+            if not buffer.strip():
+                continue
+
+            if placeholder is None:
+                placeholder = await send("…")
+            elif len(buffer) - last_edit_len >= EDIT_THROTTLE_CHARS:
+                try:
+                    await placeholder.edit_text(buffer)
+                    last_edit_len = len(buffer)
+                except TelegramRetryAfter as e:
+                    await asyncio.sleep(e.retry_after)
+                except TelegramBadRequest:
+                    pass
+    finally:
+        stop_typing.set()
+        typing_task.cancel()
+
+    if had_error:
+        if placeholder is not None:
             try:
-                await placeholder.edit_text(buffer)
-                last_edit_len = len(buffer)
-            except TelegramRetryAfter as e:
-                await asyncio.sleep(e.retry_after)
+                await placeholder.edit_text("یه مشکلی پیش اومد. یه‌بار دیگه امتحان کن.")
             except TelegramBadRequest:
-                pass  # متن تغییری نکرده یا خطای بی‌اهمیت
+                pass
+        else:
+            await send("یه مشکلی پیش اومد. یه‌بار دیگه امتحان کن.")
+        return
 
-    if had_error or not buffer.strip():
-        try:
-            await placeholder.edit_text("یه مشکلی پیش اومد. یه‌بار دیگه امتحان کن.")
-        except TelegramBadRequest:
-            pass
+    if not buffer.strip():
+        # فقط Reaction بود، متن اضافه‌ای لازم نیست
+        if placeholder is not None:
+            try:
+                await placeholder.delete()
+            except TelegramBadRequest:
+                pass
+        await db.add_turn(chat_id, "user", user_text, author_name=author_name)
+        await db.log_success(chat_id, user.id)
+        if is_group:
+            await db.mark_ambient_reply(chat_id)
         return
 
     final_html = markdown_to_telegram_html(buffer)
     try:
-        await placeholder.edit_text(final_html, parse_mode=ParseMode.HTML)
+        if placeholder is not None:
+            await placeholder.edit_text(final_html, parse_mode=ParseMode.HTML)
+        else:
+            placeholder = await send(final_html, parse_mode=ParseMode.HTML)
     except TelegramBadRequest:
         try:
-            await placeholder.edit_text(buffer)
+            if placeholder is not None:
+                await placeholder.edit_text(buffer)
+            else:
+                await send(buffer)
         except TelegramBadRequest:
             pass
 
     await db.add_turn(chat_id, "user", user_text, author_name=author_name)
     await db.add_turn(chat_id, "model", buffer)
+    await db.log_success(chat_id, user.id)
 
-    if message.chat.type != "private":
+    if is_group:
         await db.mark_ambient_reply(chat_id)
+
+
+# ---------------------------------------------------------------------------
+# پنل ادمین
+# ---------------------------------------------------------------------------
+def _admin_list_kb(users: list[dict], page: int, total: int) -> InlineKeyboardMarkup:
+    rows = []
+    for u in users:
+        label = f"{'⭐' if u['premium'] else '▫️'} {u['first_name'] or u['user_id']}"
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"adm_u:{u['user_id']}:{page}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️ قبلی", callback_data=f"adm_p:{page-1}"))
+    if (page + 1) * ADMIN_PAGE_SIZE < total:
+        nav.append(InlineKeyboardButton(text="بعدی ▶️", callback_data=f"adm_p:{page+1}"))
+    if nav:
+        rows.append(nav)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _render_admin_list(page: int) -> tuple[str, InlineKeyboardMarkup]:
+    total = await db.count_users()
+    premium_count = await db.count_premium()
+    users = await db.list_users(ADMIN_PAGE_SIZE, page * ADMIN_PAGE_SIZE)
+    text = (
+        "🛠 <b>پنل مدیریت Elena</b>\n\n"
+        f"کل کاربران: <b>{total}</b>\n"
+        f"مشترک‌های فعال: <b>{premium_count}</b>\n\n"
+        f"صفحه‌ی {page + 1} — روی هر کاربر بزن برای مدیریت:"
+    )
+    return text, _admin_list_kb(users, page, total)
+
+
+async def _render_admin_user(user_id: int, page: int) -> tuple[str, InlineKeyboardMarkup]:
+    u = await db.get_user(user_id)
+    if not u:
+        return "کاربر پیدا نشد.", _admin_list_kb([], page, 0)
+    status = "⭐ مشترک" if u["premium"] else "▫️ بدون اشتراک"
+    text = (
+        f"👤 <b>{u['first_name'] or '—'}</b>\n"
+        + (f"یوزرنیم: @{u['username']}\n" if u["username"] else "")
+        + f"آیدی: <code>{u['user_id']}</code>\n"
+        + f"عضویت از: {u['created_at'].strftime('%Y-%m-%d')}\n"
+        + f"وضعیت: {status}"
+    )
+    toggle_text = "❌ لغو اشتراک" if u["premium"] else "⭐ فعال‌سازی اشتراک"
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=toggle_text, callback_data=f"adm_t:{user_id}:{page}")],
+            [InlineKeyboardButton(text="◀️ بازگشت به لیست", callback_data=f"adm_p:{page}")],
+        ]
+    )
+    return text, kb
 
 
 def register_handlers(dp: Dispatcher) -> None:
@@ -223,53 +342,72 @@ def register_handlers(dp: Dispatcher) -> None:
     @dp.message(CommandStart())
     async def cmd_start(message: Message) -> None:
         await db.upsert_user(message.from_user.id, message.from_user.first_name, message.from_user.username)
-        name = message.from_user.first_name
-        text = (
-            f"سلام، {name}\n\n"
-            "من النا - Elena هستم. می‌تونی اینجا بهم پیام بدی یا من رو به یک گروه اضافه کنی.\n\n"
-            "من پیام‌های صوتی، عکس‌ها و فایل‌های PDF رو می‌فهمم. درباره هر چیزی که می‌خوای بنویس."
-        )
-        await message.answer(text, reply_markup=main_menu_kb())
+        if message.chat.type == "private":
+            name = message.from_user.first_name
+            text = (
+                f"سلام، {name}\n\n"
+                "من النا - Elena هستم. می‌تونی اینجا بهم پیام بدی یا من رو به یک گروه اضافه کنی.\n\n"
+                "من پیام‌های صوتی، عکس‌ها و فایل‌های PDF رو می‌فهمم. درباره هر چیزی که می‌خوای بنویس."
+            )
+        else:
+            text = GROUP_JOIN_TEXT
+        await message.answer(text, reply_markup=group_button_kb())
+
+    @dp.my_chat_member()
+    async def on_bot_membership_changed(event: ChatMemberUpdated) -> None:
+        if event.chat.type not in ("group", "supergroup"):
+            return
+        old_status = event.old_chat_member.status
+        new_status = event.new_chat_member.status
+        if old_status in ("left", "kicked") and new_status in ("member", "administrator"):
+            try:
+                await event.bot.send_message(event.chat.id, GROUP_JOIN_TEXT)
+            except (TelegramBadRequest, TelegramForbiddenError):
+                pass
 
     @dp.message(Command("stats"))
     async def cmd_stats(message: Message) -> None:
         used_today, used_4h = await db.get_usage(message.chat.id, message.from_user.id)
-        text = (
-            "این چت:\n"
-            f"- امروز: {used_today} از {75}\n"
-            f"- این ۴ ساعت اخیر: {used_4h} از {30}"
-        )
+        text = f"این چت:\n- امروز: {used_today} از 75\n- این ۴ ساعت اخیر: {used_4h} از 30"
         await message.answer(text)
 
     @dp.message(Command("premium"))
     async def cmd_premium(message: Message) -> None:
         await message.answer("فعلاً فروش نسخه‌ی Premium در دسترس نیست.")
 
-    @dp.message(Command("forget"))
-    async def cmd_forget(message: Message) -> None:
-        await db.forget_user(message.from_user.id)
-        await message.answer("هر چی ازت یادم بود پاک شد.")
+    @dp.message(Command("admin"))
+    async def cmd_admin(message: Message) -> None:
+        if not is_admin(message.from_user.id):
+            return  # برای بقیه کاملاً بی‌صداست
+        text, kb = await _render_admin_list(0)
+        await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
-    @dp.callback_query(F.data == "new_chat")
-    async def cb_new_chat(call: CallbackQuery) -> None:
-        await db.pool.execute("DELETE FROM conversation WHERE chat_id=$1", call.message.chat.id)
-        await call.answer("گفتگوی جدید شروع شد.")
-
-    @dp.callback_query(F.data == "stats")
-    async def cb_stats(call: CallbackQuery) -> None:
-        used_today, used_4h = await db.get_usage(call.message.chat.id, call.from_user.id)
-        await call.message.answer(f"این چت:\n- امروز: {used_today} از 75\n- این ۴ ساعت اخیر: {used_4h} از 30")
+    @dp.callback_query(F.data.startswith("adm_"))
+    async def cb_admin(call: CallbackQuery) -> None:
+        if not is_admin(call.from_user.id):
+            await call.answer()
+            return
+        action, _, rest = call.data.partition(":")
+        if action == "adm_p":
+            page = int(rest)
+            text, kb = await _render_admin_list(page)
+        elif action == "adm_u":
+            uid_str, _, page_str = rest.partition(":")
+            text, kb = await _render_admin_user(int(uid_str), int(page_str))
+        elif action == "adm_t":
+            uid_str, _, page_str = rest.partition(":")
+            uid = int(uid_str)
+            current = await db.get_user(uid)
+            await db.set_premium(uid, not bool(current and current["premium"]))
+            text, kb = await _render_admin_user(uid, int(page_str))
+        else:
+            await call.answer()
+            return
+        try:
+            await call.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        except TelegramBadRequest:
+            pass
         await call.answer()
-
-    @dp.callback_query(F.data == "premium")
-    async def cb_premium(call: CallbackQuery) -> None:
-        await call.message.answer("فعلاً فروش نسخه‌ی Premium در دسترس نیست.")
-        await call.answer()
-
-    @dp.callback_query(F.data == "clear_memory")
-    async def cb_clear_memory(call: CallbackQuery) -> None:
-        await db.forget_user(call.from_user.id)
-        await call.answer("حافظه پاک شد.")
 
     @dp.message(F.voice)
     async def on_voice(message: Message) -> None:
@@ -308,13 +446,11 @@ def register_handlers(dp: Dispatcher) -> None:
             await stream_reply(message, text)
             return
 
-        direct = is_direct_mode(message)
-        if direct:
+        if is_direct_mode(message):
             await stream_reply(message, text)
             return
 
-        # Ambient Mode: فقط پیام را برای Context ذخیره کن، بدون فراخوانی AI
-        await db.add_turn(message.chat.id, "user", text, author_name=message.from_user.first_name)
+        await db.add_turn(message.chat.id, "user", text, author_name=author_label(message))
 
         if not is_ambient_worthy(text):
             return
@@ -323,8 +459,6 @@ def register_handlers(dp: Dispatcher) -> None:
         if random.random() > AMBIENT_PROBABILITY:
             return
 
-        # این پیام از دید کاربر «معمولی» است، نه خطاب به النا؛ آخرین turn ای که
-        # همین الان ذخیره کردیم را حذف می‌کنیم چون stream_reply خودش دوباره ثبتش می‌کند
         await db.pool.execute(
             """
             DELETE FROM conversation WHERE id = (
@@ -337,41 +471,46 @@ def register_handlers(dp: Dispatcher) -> None:
 
 
 async def main() -> None:
-    global db, bot_id, bot_username
+    global db, bot_id, bot_username, admin_id
 
     bot_token = os.environ["BOT_TOKEN"]
     database_url = os.environ["DATABASE_URL"]
+    admin_id_raw = os.environ.get("ADMIN_ID")
+    admin_id = int(admin_id_raw) if admin_id_raw else None
 
     ai.init_client()
     db = Database(database_url)
     await db.connect()
 
     bot = Bot(token=bot_token, default=DefaultBotProperties(parse_mode=None))
-    # اگر قبلاً (مثلاً در یک اجرای دیگر) Webhook روی این توکن تنظیم شده باشه،
-    # getUpdates با خطای Conflict رد می‌شه؛ برای Polling باید همیشه پاکش کنیم.
-    info_before = await bot.get_webhook_info()
-    logger.info("Webhook before cleanup: url=%r pending=%s", info_before.url, info_before.pending_update_count)
-    deleted = await bot.delete_webhook(drop_pending_updates=True)
-    info_after = await bot.get_webhook_info()
-    logger.info("delete_webhook() -> %s | Webhook after cleanup: url=%r", deleted, info_after.url)
+    await bot.delete_webhook(drop_pending_updates=True)
     me = await bot.get_me()
     bot_id, bot_username = me.id, (me.username or "")
 
     await bot.set_my_commands(
         [
-            {"command": "start", "description": "شروع کار با Elena"},
-            {"command": "stats", "description": "وضعیت مصرف"},
-            {"command": "premium", "description": "وضعیت Premium"},
-            {"command": "forget", "description": "پاک کردن حافظه‌ی من"},
+            {"command": "start", "description": "Start — Restart Elna"},
+            {"command": "stats", "description": "Consumption status"},
+            {"command": "premium", "description": "Upgrade subscription"},
         ]
     )
+    if admin_id:
+        await bot.set_my_commands(
+            [
+                {"command": "start", "description": "Start — Restart Elna"},
+                {"command": "stats", "description": "Consumption status"},
+                {"command": "premium", "description": "Upgrade subscription"},
+                {"command": "admin", "description": "پنل مدیریت"},
+            ],
+            scope=BotCommandScopeChat(chat_id=admin_id),
+        )
 
     dp = Dispatcher()
     dp.update.outer_middleware(dedup_outer_middleware)
     register_handlers(dp)
 
     try:
-        await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
+        await dp.start_polling(bot, allowed_updates=["message", "callback_query", "my_chat_member"])
     finally:
         await db.close()
         await bot.session.close()
