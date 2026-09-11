@@ -23,6 +23,8 @@ from google.genai import types
 logger = logging.getLogger("elena.ai")
 
 MODEL_NAME = "gemini-3.6-flash"  # داخلی؛ به کاربر نمایش داده نمی‌شود
+UNAVAILABLE_MODELS = {"gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"}
+FALLBACK_MODEL = "gemini-3.6-flash"
 
 _client: genai.Client | None = None
 
@@ -93,49 +95,25 @@ TECHNICAL_ADDENDUM = """
    بلوک کد سه بک‌تیک برای کد، > برای نقل‌قول.
 ۵. اگر لازم بود اطلاعات به‌روز یا خبری پیدا کنی (چیزی که ممکن است بعد از زمان
    آموزشت تغییر کرده باشد)، از ابزار جست‌وجوی وب که در اختیارت هست استفاده کن؛
-   هیچ‌وقت درباره‌ی این‌که "دسترسی به اینترنت ندارم" حرف نزن، چون داری.
-
-# پروتکل React (اختیاری، فقط وقتی واقعاً جا دارد)
-اگر یک پیام فقط با یک ایموجی به‌جای جواب کامل بهتر جواب داده می‌شود (مثلاً یک شوخی
-ساده، یا یک حرف که فقط لایق یک واکنش است نه توضیح)، می‌توانی پاسخت را **فقط** با
-یکی از این خط‌ها شروع کنی (دقیقاً همین قالب، در ابتدای خروجی):
-REACT:❤️
-REACT:👍
-REACT:👎
-REACT:🔥
-REACT:😁
-REACT:🤣
-REACT:🤔
-REACT:🎉
-REACT:😢
-REACT:😡
-REACT:💔
-REACT:👏
-بعد از این خط می‌توانی یا هیچ متنی ننویسی (یعنی فقط واکنش بزن و همین) یا در خط بعد
-پاسخ معمولی‌ات را هم بنویسی. این قابلیت را زیاد استفاده نکن — بیشتر پیام‌ها باید
-جواب متنی معمولی بگیرند، نه صرفاً واکنش.
+   هیچ‌وقت درباره‌ی این‌که "دسترسی به اینترنت ندارم" حرف نزن، چون ابزار جست‌وجوی
+   وب برایت فراهم شده است.
 """.strip()
 
 SYSTEM_INSTRUCTION = PERSONALITY_PROMPT + "\n\n" + TECHNICAL_ADDENDUM
 
-_NAME_PATTERN = re.compile(r"(?<!\w)(الن‌?ا|elena|ely|eli)(?!\w)", re.IGNORECASE)
-
 
 def message_calls_elena(text: str) -> bool:
-    """تشخیص صدا زدن النا با نام (با word boundary، برای جلوگیری از False Positive)."""
-    if not text:
-        return False
-    return bool(_NAME_PATTERN.search(text))
+    t = (text or "").strip().lower()
+    return bool(re.search(r"(?:النا|elena)", t))
 
 
 def _history_to_contents(history: list[dict]) -> list[types.Content]:
     contents: list[types.Content] = []
-    for turn in history:
-        role = "model" if turn["role"] == "model" else "user"
-        prefix = f"[{turn['author_name']}]: " if turn.get("author_name") and role == "user" else ""
-        contents.append(
-            types.Content(role=role, parts=[types.Part(text=prefix + turn["content"])])
-        )
+    for item in history:
+        role = "model" if item.get("role") == "model" else "user"
+        author = item.get("author_name")
+        prefix = f"[{author}]: " if author else ""
+        contents.append(types.Content(role=role, parts=[types.Part(text=prefix + item["content"])]))
     return contents
 
 
@@ -171,8 +149,11 @@ async def generate_reply_stream(
     )
 
     try:
+        model = MODEL_NAME if MODEL_NAME not in UNAVAILABLE_MODELS else FALLBACK_MODEL
+        if model != MODEL_NAME:
+            logger.warning("Model %s is unavailable for this API key; using %s", MODEL_NAME, FALLBACK_MODEL)
         stream = await _client.aio.models.generate_content_stream(
-            model=MODEL_NAME, contents=contents, config=config
+            model=model, contents=contents, config=config
         )
         async for chunk in stream:
             if chunk.text:
